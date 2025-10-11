@@ -1,0 +1,856 @@
+#!/usr/bin/env python3
+"""
+dstatus - Docker Compose Project Manager TUI
+A terminal user interface for managing Docker and Docker Compose projects.
+"""
+
+import curses
+import docker
+import os
+import subprocess
+import sys
+from collections import defaultdict
+from typing import List, Dict
+
+VERSION = "1.0.0"
+
+# Color pair mappings for container statuses
+STATUS_COLORS = {
+    'running': 2,      # Green
+    'exited': 1,       # Red
+    'paused': 3,       # Yellow
+    'restarting': 3,   # Yellow
+    'created': 4,      # Blue
+}
+
+
+class DockerManager:
+    """Handles Docker API interactions and data retrieval."""
+
+    def __init__(self):
+        """Initialize Docker client connection."""
+        try:
+            self.client = docker.from_env()
+        except Exception as e:
+            print(f"Error connecting to Docker: {e}")
+            print("Make sure Docker is running and you have permissions.")
+            sys.exit(1)
+
+    def get_grouped_containers(self) -> Dict:
+        """
+        Retrieve all containers grouped by Docker Compose project.
+
+        Returns:
+            Dict containing projects with their containers and metadata.
+        """
+        containers = self.client.containers.list(all=True)
+        groups = defaultdict(lambda: {'containers': [], 'working_dir': None})
+        standalone = []
+
+        for container in containers:
+            labels = container.labels
+            project = labels.get('com.docker.compose.project')
+
+            if project:
+                # Container belongs to a compose project
+                working_dir = labels.get('com.docker.compose.project.working_dir', 'Unknown')
+                service = labels.get('com.docker.compose.service', 'unknown')
+
+                groups[project]['working_dir'] = working_dir
+                groups[project]['containers'].append({
+                    'id': container.id[:12],
+                    'name': container.name,
+                    'service': service,
+                    'status': container.status,
+                    'image': container.image.tags[0] if container.image.tags else container.image.id[:12],
+                    'ports': self._format_ports(container.ports),
+                    'container': container
+                })
+            else:
+                # Standalone container (not part of compose project)
+                standalone.append({
+                    'id': container.id[:12],
+                    'name': container.name,
+                    'service': None,
+                    'status': container.status,
+                    'image': container.image.tags[0] if container.image.tags else container.image.id[:12],
+                    'ports': self._format_ports(container.ports),
+                    'container': container
+                })
+
+        if standalone:
+            groups['[Standalone Containers]'] = {
+                'working_dir': None,
+                'containers': standalone
+            }
+
+        return dict(groups)
+
+    def _format_ports(self, ports: Dict) -> str:
+        """Format port mappings for display (e.g., '0.0.0.0:8080→80/tcp')."""
+        if not ports:
+            return ""
+
+        port_list = []
+        for container_port, host_bindings in ports.items():
+            if host_bindings:
+                for binding in host_bindings:
+                    host_ip = binding.get('HostIp', '0.0.0.0')
+                    host_port = binding.get('HostPort', '')
+                    port_list.append(f"{host_ip}:{host_port}→{container_port}")
+            else:
+                port_list.append(str(container_port))
+
+        return ", ".join(port_list[:2])  # Limit to 2 ports for brevity
+
+
+class DockerTUI:
+    """Terminal User Interface for Docker management."""
+
+    def __init__(self, stdscr):
+        """Initialize TUI with curses screen."""
+        self.stdscr = stdscr
+        self.manager = DockerManager()
+
+        # Navigation state
+        self.current_line = 0
+        self.scroll_offset = 0
+        self.items = []
+
+        # View state management
+        self.show_menu = False
+        self.view_mode = 'list'  # 'list', 'detail', or 'volume_menu'
+        self.detail_item = None
+        self.menu_selection = 0
+        self.volume_data = None
+        self.volume_selection = 0
+
+        # Menu options for containers
+        self.container_menu_options = [
+            ('l', 'View Logs'),
+            ('r', 'Restart'),
+            ('s', 'Stop'),
+            ('S', 'Start'),
+            ('p', 'Pause/Unpause'),
+            ('e', 'Exec Shell'),
+            ('i', 'Inspect'),
+            ('R', 'Remove'),
+            ('ESC', 'Back'),
+        ]
+
+        # Menu options for projects
+        self.project_menu_options = [
+            ('u', 'Up (Start All)'),
+            ('d', 'Down (Stop All)'),
+            ('r', 'Restart All'),
+            ('p', 'Pull Images'),
+            ('b', 'Build'),
+            ('l', 'View Logs (All)'),
+            ('v', 'Manage Volumes'),
+            ('c', 'View Compose File'),
+            ('i', 'Project Info'),
+            ('ESC', 'Back'),
+        ]
+
+        self._init_colors()
+        curses.curs_set(0)  # Hide cursor
+
+    def _init_colors(self):
+        """Initialize curses color pairs."""
+        curses.start_color()
+        curses.use_default_colors()
+        curses.init_pair(1, curses.COLOR_RED, -1)
+        curses.init_pair(2, curses.COLOR_GREEN, -1)
+        curses.init_pair(3, curses.COLOR_YELLOW, -1)
+        curses.init_pair(4, curses.COLOR_BLUE, -1)
+        curses.init_pair(5, curses.COLOR_CYAN, -1)
+        curses.init_pair(6, curses.COLOR_MAGENTA, -1)
+        curses.init_pair(7, curses.COLOR_WHITE, curses.COLOR_BLUE)
+
+    def build_items(self, groups: Dict) -> List[Dict]:
+        """Build flat list of navigable items from grouped containers."""
+        items = []
+
+        for project_name in sorted(groups.keys()):
+            project = groups[project_name]
+
+            # Add project header as navigable item
+            items.append({
+                'type': 'project',
+                'name': project_name,
+                'working_dir': project['working_dir'],
+                'containers': project['containers']
+            })
+
+            # Add containers under project
+            for container in project['containers']:
+                items.append({
+                    'type': 'container',
+                    'project': project_name,
+                    **container
+                })
+
+        return items
+
+    def draw_header(self):
+        """Draw the application header bar."""
+        height, width = self.stdscr.getmaxyx()
+        header = "╔═ DOCKER STATUS ═══════════════════════════════════════════════════════"
+        self.stdscr.addstr(0, 0, header[:width-1], curses.color_pair(5) | curses.A_BOLD)
+
+        hint = "↑↓: Navigate | ENTER: Actions | q: Quit | F5: Refresh"
+        if len(hint) < width - 2:
+            self.stdscr.addstr(1, 2, hint, curses.color_pair(4))
+
+    def draw_detail_view(self):
+        """Draw full-screen detail view for selected item."""
+        height, width = self.stdscr.getmaxyx()
+        item = self.detail_item
+
+        if item['type'] == 'project':
+            self.draw_project_detail(item, height, width)
+        else:
+            self.draw_container_detail(item, height, width)
+
+    def draw_project_detail(self, item, height, width):
+        """Draw project detail view with compose operations."""
+        y = 3
+
+        # Project information section
+        header = f"  PROJECT: {item['name']}"
+        self.stdscr.addstr(y, 4, "─" * (width - 8), curses.color_pair(5))
+        y += 1
+        self.stdscr.addstr(y, 4, header, curses.color_pair(6) | curses.A_BOLD)
+        y += 1
+
+        if item['working_dir']:
+            dir_str = f"  Location: {item['working_dir']}"
+            self.stdscr.addstr(y, 4, dir_str[:width-8], curses.color_pair(4))
+            y += 1
+
+        # Container status summary
+        running = sum(1 for c in item['containers'] if c['status'] == 'running')
+        total = len(item['containers'])
+        status_str = f"  Containers: {running}/{total} running"
+        color = curses.color_pair(2) if running == total else curses.color_pair(3)
+        self.stdscr.addstr(y, 4, status_str, color)
+        y += 2
+
+        self.stdscr.addstr(y, 4, "─" * (width - 8), curses.color_pair(5))
+        y += 2
+
+        # Render menu options
+        self._render_menu_options(self.project_menu_options, y, width)
+
+    def draw_container_detail(self, item, height, width):
+        """Draw container detail view with container operations."""
+        y = 3
+
+        # Container information section
+        header = f"  CONTAINER: {item['name']}"
+        self.stdscr.addstr(y, 4, "─" * (width - 8), curses.color_pair(5))
+        y += 1
+        self.stdscr.addstr(y, 4, header, curses.color_pair(6) | curses.A_BOLD)
+        y += 2
+
+        # Status and details
+        status = item['status']
+        color = STATUS_COLORS.get(status, 4)
+        status_str = f"  Status: {status.upper()}"
+        self.stdscr.addstr(y, 4, status_str, curses.color_pair(color) | curses.A_BOLD)
+        y += 1
+
+        image_str = f"  Image: {item['image']}"
+        self.stdscr.addstr(y, 4, image_str[:width-8], curses.color_pair(4))
+        y += 1
+
+        if item['ports']:
+            ports_str = f"  Ports: {item['ports']}"
+            self.stdscr.addstr(y, 4, ports_str[:width-8], curses.color_pair(4))
+            y += 1
+
+        if item.get('service'):
+            service_str = f"  Service: {item['service']}"
+            self.stdscr.addstr(y, 4, service_str, curses.color_pair(4))
+            y += 1
+
+        y += 1
+        self.stdscr.addstr(y, 4, "─" * (width - 8), curses.color_pair(5))
+        y += 2
+
+        # Render menu options
+        self._render_menu_options(self.container_menu_options, y, width)
+
+    def _render_menu_options(self, menu_options, y, width):
+        """Render centered menu options with selection indicator."""
+        max_option_width = max(len(action) for _, action in menu_options[:-1]) + 10
+        start_x = (width - max_option_width) // 2
+
+        for idx, (key, action) in enumerate(menu_options):
+            if action == 'Back':
+                continue
+
+            is_selected = idx == self.menu_selection
+            option_str = f" [{key}]  {action}"
+
+            if is_selected:
+                attr = curses.color_pair(7) | curses.A_BOLD
+                self.stdscr.addstr(y + idx, start_x - 2, "▶", curses.color_pair(5) | curses.A_BOLD)
+            else:
+                attr = curses.color_pair(5)
+
+            self.stdscr.addstr(y + idx, start_x, option_str, attr)
+
+        # Footer hint
+        height = self.stdscr.getmaxyx()[0]
+        hint = "↑↓: Navigate | ENTER: Execute | ESC/q: Back"
+        self.stdscr.addstr(height - 3, (width - len(hint)) // 2, hint, curses.color_pair(4))
+
+    def draw_items(self):
+        """Draw the main container/project list view."""
+        height, width = self.stdscr.getmaxyx()
+        display_height = height - 4
+
+        visible_items = self.items[self.scroll_offset:self.scroll_offset + display_height]
+
+        for idx, item in enumerate(visible_items):
+            y_pos = idx + 3
+            actual_idx = idx + self.scroll_offset
+            is_selected = actual_idx == self.current_line
+
+            if item['type'] == 'project':
+                # Render project header
+                working_dir = f" ({item['working_dir']})" if item['working_dir'] else ""
+                project_str = f"┌─ {item['name']}{working_dir}"
+
+                attr = curses.color_pair(6) | curses.A_BOLD
+                if is_selected:
+                    attr |= curses.A_REVERSE
+
+                self.stdscr.addstr(y_pos, 2, project_str[:width-3], attr)
+
+            else:
+                # Render container
+                status = item['status']
+                color = STATUS_COLORS.get(status, 4)
+                indicator = "●" if status == 'running' else "○"
+
+                service_name = item['service'] if item['service'] else item['name']
+                ports_str = f" [{item['ports']}]" if item['ports'] else ""
+                container_str = f"  ├─ {indicator} {service_name:<25} {status:<12}{ports_str}"
+
+                attr = curses.color_pair(color)
+                if is_selected:
+                    attr = curses.color_pair(7) | curses.A_BOLD
+
+                self.stdscr.addstr(y_pos, 2, container_str[:width-3], attr)
+
+    def draw_footer(self):
+        """Draw footer with container statistics."""
+        height, width = self.stdscr.getmaxyx()
+
+        running = sum(1 for item in self.items if item['type'] == 'container' and item['status'] == 'running')
+        stopped = sum(1 for item in self.items if item['type'] == 'container' and item['status'] == 'exited')
+        total = sum(1 for item in self.items if item['type'] == 'container')
+
+        footer = f"╚═ Running: {running} | Stopped: {stopped} | Total: {total} "
+        footer += "═" * (width - len(footer) - 1)
+
+        self.stdscr.addstr(height - 1, 0, footer[:width-1], curses.color_pair(5))
+
+    def draw_volume_view(self):
+        """Draw volume management interface."""
+        height, width = self.stdscr.getmaxyx()
+        y = 3
+
+        project_name = self.volume_data['project_name']
+        volumes = self.volume_data['volumes']
+
+        # Header
+        header = f"  VOLUME MANAGEMENT: {project_name}"
+        self.stdscr.addstr(y, 4, "─" * (width - 8), curses.color_pair(5))
+        y += 1
+        self.stdscr.addstr(y, 4, header, curses.color_pair(6) | curses.A_BOLD)
+        y += 2
+
+        # Volume list
+        if volumes:
+            vol_count = f"  Found {len(volumes)} volume(s)"
+            self.stdscr.addstr(y, 4, vol_count, curses.color_pair(4))
+            y += 2
+
+            for vol in volumes[:10]:
+                vol_str = f"    • {vol}"
+                self.stdscr.addstr(y, 4, vol_str[:width-8], curses.color_pair(5))
+                y += 1
+
+            if len(volumes) > 10:
+                more_str = f"    ... and {len(volumes) - 10} more"
+                self.stdscr.addstr(y, 4, more_str, curses.color_pair(3))
+                y += 1
+        else:
+            no_vol = "  No volumes found for this project"
+            self.stdscr.addstr(y, 4, no_vol, curses.color_pair(3))
+            y += 1
+
+        y += 1
+        self.stdscr.addstr(y, 4, "─" * (width - 8), curses.color_pair(5))
+        y += 2
+
+        # Menu options
+        menu_options = [
+            ('1', 'Remove All Volumes (DESTRUCTIVE!)'),
+            ('2', 'Inspect Volumes'),
+        ]
+
+        max_option_width = max(len(action) for _, action in menu_options) + 10
+        start_x = (width - max_option_width) // 2
+
+        for idx, (key, action) in enumerate(menu_options):
+            is_selected = idx == self.volume_selection
+            option_str = f" [{key}]  {action}"
+
+            if 'DESTRUCTIVE' in action:
+                color = curses.color_pair(1)
+            else:
+                color = curses.color_pair(5)
+
+            if is_selected:
+                attr = curses.color_pair(7) | curses.A_BOLD
+                self.stdscr.addstr(y + idx, start_x - 2, "▶", curses.color_pair(5) | curses.A_BOLD)
+            else:
+                attr = color
+
+            self.stdscr.addstr(y + idx, start_x, option_str, attr)
+
+        hint = "↑↓: Navigate | ENTER: Execute | ESC/q: Back"
+        self.stdscr.addstr(height - 3, (width - len(hint)) // 2, hint, curses.color_pair(4))
+
+    def refresh_data(self):
+        """Refresh container data from Docker."""
+        groups = self.manager.get_grouped_containers()
+        self.items = self.build_items(groups)
+
+        if self.current_line >= len(self.items):
+            self.current_line = max(0, len(self.items) - 1)
+
+    def handle_action(self, key: str, container):
+        """Execute container-level actions."""
+        try:
+            if key == 'l':
+                # View logs with exit instructions
+                curses.endwin()
+                print("\n" + "="*60)
+                print(f"Viewing logs for: {container.name}")
+                print("="*60)
+                print("Press Ctrl+C to exit back to manager\n")
+                try:
+                    subprocess.run(['docker', 'logs', '-f', '--tail', '100', container.id], check=False)
+                except KeyboardInterrupt:
+                    print("\n\nExiting logs...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'r':
+                container.restart()
+                self.show_message("Container restarted", curses.color_pair(2))
+
+            elif key == 's':
+                container.stop()
+                self.show_message("Container stopped", curses.color_pair(3))
+
+            elif key == 'S':
+                container.start()
+                self.show_message("Container started", curses.color_pair(2))
+
+            elif key == 'p':
+                if container.status == 'paused':
+                    container.unpause()
+                    self.show_message("Container unpaused", curses.color_pair(2))
+                else:
+                    container.pause()
+                    self.show_message("Container paused", curses.color_pair(3))
+
+            elif key == 'e':
+                # Execute shell in container
+                curses.endwin()
+                shell = '/bin/bash'
+                try:
+                    subprocess.run(['docker', 'exec', '-it', container.id, shell], check=False)
+                except:
+                    subprocess.run(['docker', 'exec', '-it', container.id, '/bin/sh'], check=False)
+                self.stdscr = curses.initscr()
+
+            elif key == 'i':
+                # Inspect container
+                curses.endwin()
+                subprocess.run(['docker', 'inspect', container.id], check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'R':
+                # Remove container
+                container.remove(force=True)
+                self.show_message("Container removed", curses.color_pair(1))
+
+        except Exception as e:
+            self.show_message(f"Error: {str(e)}", curses.color_pair(1))
+
+    def handle_project_action(self, key: str, project_item: Dict):
+        """Execute project-level Docker Compose actions."""
+        project_name = project_item['name']
+        working_dir = project_item['working_dir']
+
+        if project_name == '[Standalone Containers]':
+            self.show_message("No compose operations for standalone containers", curses.color_pair(3))
+            return
+
+        if not working_dir or working_dir == 'Unknown':
+            self.show_message("Working directory not found for project", curses.color_pair(1))
+            return
+
+        try:
+            if key == 'u':
+                curses.endwin()
+                subprocess.run(['docker', 'compose', 'up', '-d'], cwd=working_dir, check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'd':
+                curses.endwin()
+                subprocess.run(['docker', 'compose', 'down'], cwd=working_dir, check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'r':
+                curses.endwin()
+                subprocess.run(['docker', 'compose', 'restart'], cwd=working_dir, check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'p':
+                curses.endwin()
+                subprocess.run(['docker', 'compose', 'pull'], cwd=working_dir, check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'b':
+                curses.endwin()
+                subprocess.run(['docker', 'compose', 'build'], cwd=working_dir, check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'l':
+                curses.endwin()
+                print("\n" + "="*60)
+                print(f"Viewing logs for project: {project_name}")
+                print("="*60)
+                print("Press Ctrl+C to exit back to manager\n")
+                try:
+                    subprocess.run(['docker', 'compose', 'logs', '-f', '--tail=100'], cwd=working_dir, check=False)
+                except KeyboardInterrupt:
+                    print("\n\nExiting logs...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'v':
+                self.show_volume_menu(project_name, working_dir)
+
+            elif key == 'c':
+                curses.endwin()
+                compose_files = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml']
+                compose_file = None
+                for cf in compose_files:
+                    full_path = f"{working_dir}/{cf}"
+                    try:
+                        with open(full_path, 'r'):
+                            compose_file = full_path
+                            break
+                    except:
+                        continue
+
+                if compose_file:
+                    subprocess.run(['less', compose_file], check=False)
+                else:
+                    print("Compose file not found")
+                    input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
+            elif key == 'i':
+                curses.endwin()
+                print(f"\n{'='*60}")
+                print(f"Project: {project_name}")
+                print(f"Working Directory: {working_dir}")
+                print(f"{'='*60}\n")
+
+                subprocess.run(['docker', 'compose', 'ps'], cwd=working_dir, check=False)
+                print()
+                subprocess.run(['docker', 'compose', 'images'], cwd=working_dir, check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
+        except Exception as e:
+            self.show_message(f"Error: {str(e)}", curses.color_pair(1))
+
+    def show_volume_menu(self, project_name: str, working_dir: str):
+        """Transition to volume management view."""
+        result = subprocess.run(
+            ['docker', 'volume', 'ls', '-q', '--filter', f'label=com.docker.compose.project={project_name}'],
+            capture_output=True,
+            text=True
+        )
+        volumes = [v for v in result.stdout.strip().split('\n') if v]
+
+        self.volume_data = {
+            'project_name': project_name,
+            'working_dir': working_dir,
+            'volumes': volumes
+        }
+        self.volume_selection = 0
+        self.view_mode = 'volume_menu'
+
+    def execute_volume_action(self, action_key: str):
+        """Execute volume management actions."""
+        project_name = self.volume_data['project_name']
+        working_dir = self.volume_data['working_dir']
+        volumes = self.volume_data['volumes']
+
+        if action_key == '1':
+            if self.confirm_dangerous_action("Remove ALL volumes? ALL DATA WILL BE LOST!"):
+                curses.endwin()
+                subprocess.run(['docker', 'compose', 'down', '-v'], cwd=working_dir, check=False)
+                input("\nVolumes removed! Press Enter to continue...")
+                self.stdscr = curses.initscr()
+
+        elif action_key == '2':
+            if volumes:
+                curses.endwin()
+                for vol in volumes:
+                    print(f"\n{'='*60}")
+                    print(f"Volume: {vol}")
+                    print('='*60)
+                    subprocess.run(['docker', 'volume', 'inspect', vol], check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+            else:
+                self.show_message("No volumes to inspect", curses.color_pair(3))
+
+    def confirm_dangerous_action(self, message: str) -> bool:
+        """Show confirmation dialog for destructive operations."""
+        height, width = self.stdscr.getmaxyx()
+
+        box_height = 7
+        box_width = min(len(message) + 10, width - 10)
+        start_y = height // 2 - box_height // 2
+        start_x = (width - box_width) // 2
+
+        # Draw red confirmation box
+        for i in range(box_height):
+            self.stdscr.addstr(start_y + i, start_x, " " * box_width, curses.color_pair(1))
+
+        self.stdscr.addstr(start_y, start_x, "╔" + "═" * (box_width - 2) + "╗", curses.color_pair(1) | curses.A_BOLD)
+        self.stdscr.addstr(start_y + box_height - 1, start_x, "╚" + "═" * (box_width - 2) + "╝", curses.color_pair(1) | curses.A_BOLD)
+
+        msg = message[:box_width-4]
+        self.stdscr.addstr(start_y + 2, start_x + (box_width - len(msg)) // 2, msg, curses.color_pair(1) | curses.A_BOLD)
+
+        options = "  [y] Yes    [n] No  "
+        self.stdscr.addstr(start_y + 4, start_x + (box_width - len(options)) // 2, options, curses.color_pair(1))
+
+        self.stdscr.refresh()
+
+        while True:
+            key = self.stdscr.getch()
+            if key == ord('y') or key == ord('Y'):
+                return True
+            elif key == ord('n') or key == ord('N') or key == 27:
+                return False
+
+    def show_message(self, msg: str, attr):
+        """Display temporary status message."""
+        height, width = self.stdscr.getmaxyx()
+        self.stdscr.addstr(height - 2, 2, " " * (width - 4))
+        self.stdscr.addstr(height - 2, 2, msg[:width-4], attr)
+        self.stdscr.refresh()
+        curses.napms(1500)
+
+    def transition_to_detail(self):
+        """Brief fade animation when entering detail view."""
+        for _ in range(2):
+            self.stdscr.clear()
+            self.stdscr.refresh()
+            curses.napms(30)
+
+    def run(self):
+        """Main event loop."""
+        self.refresh_data()
+
+        while True:
+            height, width = self.stdscr.getmaxyx()
+            self.stdscr.clear()
+
+            # Render appropriate view
+            if self.view_mode == 'list':
+                self.draw_header()
+                self.draw_items()
+                self.draw_footer()
+            elif self.view_mode == 'volume_menu':
+                self.draw_header()
+                self.draw_volume_view()
+                self.draw_footer()
+            else:  # detail view
+                self.draw_header()
+                self.draw_detail_view()
+                self.draw_footer()
+
+            self.stdscr.refresh()
+
+            # Handle user input
+            try:
+                key = self.stdscr.getch()
+            except KeyboardInterrupt:
+                break
+
+            # Route input to appropriate handler
+            if self.view_mode == 'volume_menu':
+                self.handle_volume_input(key)
+            elif self.view_mode == 'detail':
+                self.handle_detail_input(key)
+            else:  # list view
+                result = self.handle_list_input(key)
+                if result == 'quit':
+                    break
+
+    def handle_list_input(self, key):
+        """Handle keyboard input in list view."""
+        height = self.stdscr.getmaxyx()[0]
+
+        if key == curses.KEY_UP and self.current_line > 0:
+            self.current_line -= 1
+            if self.current_line < self.scroll_offset:
+                self.scroll_offset = self.current_line
+
+        elif key == curses.KEY_DOWN and self.current_line < len(self.items) - 1:
+            self.current_line += 1
+            display_height = height - 4
+            if self.current_line >= self.scroll_offset + display_height:
+                self.scroll_offset = self.current_line - display_height + 1
+
+        elif key == 10:  # Enter
+            item = self.items[self.current_line]
+            self.transition_to_detail()
+            self.view_mode = 'detail'
+            self.detail_item = item
+            self.menu_selection = 0
+
+        elif key == ord('q'):
+            return 'quit'
+
+        elif key == curses.KEY_F5:
+            self.refresh_data()
+            self.show_message("Refreshed", curses.color_pair(2))
+
+    def handle_volume_input(self, key):
+        """Handle keyboard input in volume management view."""
+        max_selection = 1
+
+        if key == 27 or key == ord('q'):
+            self.view_mode = 'detail'
+            self.volume_data = None
+            self.volume_selection = 0
+
+        elif key == curses.KEY_UP:
+            if self.volume_selection > 0:
+                self.volume_selection -= 1
+
+        elif key == curses.KEY_DOWN:
+            if self.volume_selection < max_selection:
+                self.volume_selection += 1
+
+        elif key == 10:  # Enter
+            action_key = str(self.volume_selection + 1)
+            self.execute_volume_action(action_key)
+            self.view_mode = 'detail'
+            self.volume_data = None
+            self.volume_selection = 0
+            self.refresh_data()
+
+        elif key == ord('1') or key == ord('2'):
+            self.execute_volume_action(chr(key))
+            self.view_mode = 'detail'
+            self.volume_data = None
+            self.volume_selection = 0
+            self.refresh_data()
+
+    def handle_detail_input(self, key):
+        """Handle keyboard input in detail view."""
+        item = self.detail_item
+        menu_options = self.project_menu_options if item['type'] == 'project' else self.container_menu_options
+        max_selection = len(menu_options) - 2
+
+        if key == 27 or key == ord('q'):
+            self.view_mode = 'list'
+            self.detail_item = None
+            self.menu_selection = 0
+
+        elif key == curses.KEY_UP:
+            if self.menu_selection > 0:
+                self.menu_selection -= 1
+
+        elif key == curses.KEY_DOWN:
+            if self.menu_selection < max_selection:
+                self.menu_selection += 1
+
+        elif key == 10:  # Enter
+            key_char, action = menu_options[self.menu_selection]
+
+            if item['type'] == 'project':
+                self.handle_project_action(key_char, item)
+            else:
+                self.handle_action(key_char, item['container'])
+
+            if self.view_mode != 'volume_menu':
+                self.view_mode = 'list'
+                self.detail_item = None
+                self.menu_selection = 0
+                self.refresh_data()
+
+        elif 32 <= key <= 126:  # Direct key shortcuts
+            key_char = chr(key)
+            if item['type'] == 'project' and key_char in ['u', 'd', 'r', 'p', 'b', 'l', 'v', 'c', 'i']:
+                self.handle_project_action(key_char, item)
+                if self.view_mode != 'volume_menu':
+                    self.view_mode = 'list'
+                    self.detail_item = None
+                    self.menu_selection = 0
+                    self.refresh_data()
+            elif item['type'] == 'container' and key_char in ['l', 'r', 's', 'S', 'p', 'e', 'i', 'R']:
+                self.handle_action(key_char, item['container'])
+                self.view_mode = 'list'
+                self.detail_item = None
+                self.menu_selection = 0
+                self.refresh_data()
+
+
+def main():
+    """Entry point for dstatus application."""
+    try:
+        # Reduce ESC key delay for instant response
+        os.environ.setdefault('ESCDELAY', '25')
+
+        stdscr = curses.initscr()
+        curses.noecho()
+        curses.cbreak()
+        stdscr.keypad(True)
+
+        tui = DockerTUI(stdscr)
+        tui.run()
+
+    finally:
+        # Cleanup curses
+        curses.nocbreak()
+        stdscr.keypad(False)
+        curses.echo()
+        curses.endwin()
+
+
+if __name__ == '__main__':
+    main()
