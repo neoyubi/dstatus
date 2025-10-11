@@ -10,6 +10,7 @@ import os
 import subprocess
 import sys
 from collections import defaultdict
+from datetime import datetime
 from typing import List, Dict
 
 VERSION = "1.0.0"
@@ -64,6 +65,7 @@ class DockerManager:
                     'status': container.status,
                     'image': container.image.tags[0] if container.image.tags else container.image.id[:12],
                     'ports': self._format_ports(container.ports),
+                    'uptime': self._format_uptime(container),
                     'container': container
                 })
             else:
@@ -75,6 +77,7 @@ class DockerManager:
                     'status': container.status,
                     'image': container.image.tags[0] if container.image.tags else container.image.id[:12],
                     'ports': self._format_ports(container.ports),
+                    'uptime': self._format_uptime(container),
                     'container': container
                 })
 
@@ -102,6 +105,31 @@ class DockerManager:
                 port_list.append(str(container_port))
 
         return ", ".join(port_list[:2])  # Limit to 2 ports for brevity
+
+    def _format_uptime(self, container) -> str:
+        """Format container uptime in a compact format."""
+        try:
+            if container.status != 'running':
+                return ""
+
+            started_at = container.attrs['State']['StartedAt']
+            # Parse Docker's ISO timestamp
+            start_time = datetime.fromisoformat(started_at.replace('Z', '+00:00'))
+            uptime_delta = datetime.now(start_time.tzinfo) - start_time
+
+            days = uptime_delta.days
+            seconds = uptime_delta.seconds
+            hours = seconds // 3600
+            minutes = (seconds % 3600) // 60
+
+            if days > 0:
+                return f"{days}d{hours}h"
+            elif hours > 0:
+                return f"{hours}h{minutes}m"
+            else:
+                return f"{minutes}m"
+        except:
+            return ""
 
 
 class DockerTUI:
@@ -336,8 +364,9 @@ class DockerTUI:
                 indicator = "●" if status == 'running' else "○"
 
                 service_name = item['service'] if item['service'] else item['name']
+                uptime_str = f" ↑{item['uptime']}" if item.get('uptime') else ""
                 ports_str = f" [{item['ports']}]" if item['ports'] else ""
-                container_str = f"  ├─ {indicator} {service_name:<25} {status:<12}{ports_str}"
+                container_str = f"  ├─ {indicator} {service_name:<25} {status:<12}{uptime_str}{ports_str}"
 
                 attr = curses.color_pair(color)
                 if is_selected:
