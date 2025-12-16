@@ -9,6 +9,7 @@ import docker
 import os
 import subprocess
 import sys
+import threading
 from collections import defaultdict
 from datetime import datetime
 from typing import List, Dict
@@ -152,6 +153,9 @@ class DockerTUI:
         self.menu_selection = 0
         self.volume_data = None
         self.volume_selection = 0
+
+        # Background operation tracking
+        self.bg_operation = None  # {'project': str, 'status': str, 'thread': Thread}
 
         # Menu options for containers
         self.container_menu_options = [
@@ -383,10 +387,39 @@ class DockerTUI:
         stopped = sum(1 for item in self.items if item['type'] == 'container' and item['status'] == 'exited')
         total = sum(1 for item in self.items if item['type'] == 'container')
 
-        footer = f"╚═ Running: {running} | Stopped: {stopped} | Total: {total} "
+        # Show background operation status if active
+        if self.bg_operation:
+            op = self.bg_operation
+            if op['thread'] and op['thread'].is_alive():
+                op_str = f" ⟳ {op['project']}: {op['status']} "
+                footer = f"╚═ Running: {running} | Stopped: {stopped} | Total: {total} │{op_str}"
+            elif op['status'] == 'Done':
+                op_str = f" ✓ {op['project']}: Recreated "
+                footer = f"╚═ Running: {running} | Stopped: {stopped} | Total: {total} │{op_str}"
+            else:
+                footer = f"╚═ Running: {running} | Stopped: {stopped} | Total: {total} "
+        else:
+            footer = f"╚═ Running: {running} | Stopped: {stopped} | Total: {total} "
+
         footer += "═" * (width - len(footer) - 1)
 
         self.stdscr.addstr(height - 1, 0, footer[:width-1], curses.color_pair(5))
+
+        # Highlight the operation status part
+        if self.bg_operation and self.bg_operation['thread']:
+            op = self.bg_operation
+            if op['thread'].is_alive():
+                # Yellow for in-progress
+                op_start = footer.find('⟳')
+                if op_start != -1:
+                    op_str = f"⟳ {op['project']}: {op['status']}"
+                    self.stdscr.addstr(height - 1, op_start, op_str, curses.color_pair(3) | curses.A_BOLD)
+            elif op['status'] == 'Done':
+                # Green for done
+                op_start = footer.find('✓')
+                if op_start != -1:
+                    op_str = f"✓ {op['project']}: Recreated"
+                    self.stdscr.addstr(height - 1, op_start, op_str, curses.color_pair(2) | curses.A_BOLD)
 
     def draw_volume_view(self):
         """Draw volume management interface."""
@@ -558,14 +591,10 @@ class DockerTUI:
                 self.stdscr = curses.initscr()
 
             elif key == 'D':
-                curses.endwin()
-                print(f"\nRecreating project: {project_name}")
-                print("Running: docker compose down...")
-                subprocess.run(['docker', 'compose', 'down'], cwd=working_dir, check=False)
-                print("\nRunning: docker compose up -d...")
-                subprocess.run(['docker', 'compose', 'up', '-d'], cwd=working_dir, check=False)
-                input("\nPress Enter to continue...")
-                self.stdscr = curses.initscr()
+                if self.bg_operation and self.bg_operation['thread'].is_alive():
+                    self.show_message("Operation already in progress", curses.color_pair(3))
+                    return
+                self._start_recreate(project_name, working_dir)
 
             elif key == 'p':
                 curses.endwin()
@@ -629,6 +658,38 @@ class DockerTUI:
 
         except Exception as e:
             self.show_message(f"Error: {str(e)}", curses.color_pair(1))
+
+    def _start_recreate(self, project_name: str, working_dir: str):
+        """Start background recreate operation."""
+        self.bg_operation = {
+            'project': project_name,
+            'status': 'Stopping...',
+            'thread': None
+        }
+
+        def worker():
+            try:
+                self.bg_operation['status'] = 'Stopping...'
+                subprocess.run(
+                    ['docker', 'compose', 'down'],
+                    cwd=working_dir,
+                    capture_output=True,
+                    check=False
+                )
+                self.bg_operation['status'] = 'Starting...'
+                subprocess.run(
+                    ['docker', 'compose', 'up', '-d'],
+                    cwd=working_dir,
+                    capture_output=True,
+                    check=False
+                )
+                self.bg_operation['status'] = 'Done'
+            except Exception as e:
+                self.bg_operation['status'] = f'Error: {e}'
+
+        thread = threading.Thread(target=worker, daemon=True)
+        self.bg_operation['thread'] = thread
+        thread.start()
 
     def show_volume_menu(self, project_name: str, working_dir: str):
         """Transition to volume management view."""
@@ -722,8 +783,26 @@ class DockerTUI:
     def run(self):
         """Main event loop."""
         self.refresh_data()
+        self._bg_done_time = None  # Track when bg operation completed
 
         while True:
+            # Use timeout for non-blocking input when bg operation is running
+            if self.bg_operation and self.bg_operation['thread'] and self.bg_operation['thread'].is_alive():
+                self.stdscr.timeout(500)  # 500ms timeout for updates
+            else:
+                self.stdscr.timeout(-1)  # Blocking input
+
+            # Check if background operation just completed
+            if self.bg_operation and self.bg_operation['thread']:
+                if not self.bg_operation['thread'].is_alive() and self.bg_operation['status'] == 'Done':
+                    if self._bg_done_time is None:
+                        self._bg_done_time = datetime.now()
+                        self.refresh_data()  # Refresh once when done
+                    elif (datetime.now() - self._bg_done_time).seconds >= 3:
+                        # Clear after 3 seconds
+                        self.bg_operation = None
+                        self._bg_done_time = None
+
             height, width = self.stdscr.getmaxyx()
             self.stdscr.clear()
 
@@ -747,7 +826,15 @@ class DockerTUI:
             try:
                 key = self.stdscr.getch()
             except KeyboardInterrupt:
-                break
+                if self.bg_operation and self.bg_operation['thread'] and self.bg_operation['thread'].is_alive():
+                    if self.confirm_dangerous_action("Operation in progress. Exit anyway?"):
+                        break
+                else:
+                    break
+
+            # Skip on timeout (no input)
+            if key == -1:
+                continue
 
             # Route input to appropriate handler
             if self.view_mode == 'volume_menu':
@@ -782,7 +869,11 @@ class DockerTUI:
             self.menu_selection = 0
 
         elif key == ord('q'):
-            return 'quit'
+            if self.bg_operation and self.bg_operation['thread'] and self.bg_operation['thread'].is_alive():
+                if self.confirm_dangerous_action("Operation in progress. Exit anyway?"):
+                    return 'quit'
+            else:
+                return 'quit'
 
         elif key == curses.KEY_F5:
             self.refresh_data()
