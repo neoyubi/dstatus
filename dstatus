@@ -171,6 +171,7 @@ class DockerTUI:
             ('u', 'Up (Start All)'),
             ('d', 'Down (Stop All)'),
             ('r', 'Restart All'),
+            ('D', 'Recreate (Down+Up)'),
             ('p', 'Pull Images'),
             ('b', 'Build'),
             ('l', 'View Logs (All)'),
@@ -556,6 +557,16 @@ class DockerTUI:
                 input("\nPress Enter to continue...")
                 self.stdscr = curses.initscr()
 
+            elif key == 'D':
+                curses.endwin()
+                print(f"\nRecreating project: {project_name}")
+                print("Running: docker compose down...")
+                subprocess.run(['docker', 'compose', 'down'], cwd=working_dir, check=False)
+                print("\nRunning: docker compose up -d...")
+                subprocess.run(['docker', 'compose', 'up', '-d'], cwd=working_dir, check=False)
+                input("\nPress Enter to continue...")
+                self.stdscr = curses.initscr()
+
             elif key == 'p':
                 curses.endwin()
                 subprocess.run(['docker', 'compose', 'pull'], cwd=working_dir, check=False)
@@ -844,7 +855,7 @@ class DockerTUI:
 
         elif 32 <= key <= 126:  # Direct key shortcuts
             key_char = chr(key)
-            if item['type'] == 'project' and key_char in ['u', 'd', 'r', 'p', 'b', 'l', 'v', 'c', 'i']:
+            if item['type'] == 'project' and key_char in ['u', 'd', 'r', 'D', 'p', 'b', 'l', 'v', 'c', 'i']:
                 self.handle_project_action(key_char, item)
                 if self.view_mode != 'volume_menu':
                     self.view_mode = 'list'
